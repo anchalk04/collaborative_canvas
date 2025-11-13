@@ -1,0 +1,850 @@
+<!-- <!DOCTYPE html>
+<html>
+<head>
+    <title>Collaborative Canvas Chat</title>
+    <style>
+        body { 
+            margin: 0; 
+            padding-bottom: 3rem; 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            text-align: center;
+        }
+        #canvas {
+            border: 1px solid #ccc;
+            background-color: #fff;
+            cursor: crosshair;
+            display: block;
+        }
+        #form { 
+            background: rgba(0, 0, 0, 0.15); 
+            padding: 0.25rem; 
+            position: fixed; 
+            bottom: 0; 
+            left: 0; 
+            right: 0; 
+            display: flex; 
+            height: 3rem; 
+            box-sizing: border-box; 
+            backdrop-filter: blur(10px); 
+        }
+        #input { 
+            border: none; 
+            padding: 0 1rem; 
+            flex-grow: 1; 
+            border-radius: 2rem; 
+            margin: 0.25rem; 
+        }
+        #input:focus { outline: none; }
+        #form > button { 
+            background: #333; 
+            border: none; 
+            padding: 0 1rem; 
+            margin: 0.25rem; 
+            border-radius: 3px; 
+            outline: none; 
+            color: #fff; 
+            cursor: pointer;
+        }
+        #messages { list-style-type: none; margin: 0; padding: 0; }
+        #messages > li { padding: 0.5rem 1rem; text-align: left;}
+        #messages > li:nth-child(odd) { background: #efefef; }
+        .active-tool {
+            border: 2px solid #007bff;
+            background-color: #e9ecef;
+        }
+        .user-cursor {
+            position: absolute;
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+            border: 2px solid white;
+            opacity: 0.8;
+            transform: translate(-50%, -50%);
+            transition: transform 0.05s ease-out;
+            z-index: 1000;
+        }
+        .controls-container {
+            margin: 10px auto;
+            width: 800px;
+            text-align: left;
+            padding-left: 10px;
+        }
+        .controls-container > * {
+            margin-right: 15px;
+        }
+    </style>
+</head>
+<body>
+    
+    <div class="controls-container">
+        <label for="colorPicker">Select Color:</label>
+        <input type="color" id="colorPicker" value="#000000">
+
+        <label for="strokeWidth">Width:</label>
+        <input type="range" id="strokeWidth" min="1" max="50" value="5">
+        <span id="widthValue">5</span>px
+
+        <button id="eraserButton">Eraser</button>
+        <button id="undoButton">Undo</button>
+        <button id="redoButton">Redo</button>
+        <button id="clearButton">Clear Canvas</button>
+    </div>
+
+    <div style="position: relative; width: 800px; height: 600px; margin: 20px auto;">
+        <canvas id="canvas" width="800" height="600"></canvas>
+        
+        <div id="cursor-container"></div>
+    </div>
+
+    <div style="margin-top: 10px; border: 1px solid #ddd; padding: 10px; width: 800px; margin: 20px auto;">
+        <h4>Online Users: <span id="userCount">0</span></h4>
+        <ul id="onlineUsersList" style="list-style: none; padding: 0;"></ul>
+    </div>
+    
+    <ul id="messages"></ul>
+
+    <form id="form">
+        <input id="input" autocomplete="off" placeholder="Type a message..." />
+        <button>Send</button>
+    </form>
+
+    <script src="/socket.io/socket.io.js"></script>
+    
+    <script>
+        // --- INITIAL SETUP ---
+        const socket = io('http://localhost:3000'); 
+        
+        // DOM Elements
+        const form = document.getElementById('form');
+        const input = document.getElementById('input');
+        const messages = document.getElementById('messages');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const colorPicker = document.getElementById('colorPicker');
+        const strokeWidthInput = document.getElementById('strokeWidth'); 
+        const widthValueSpan = document.getElementById('widthValue');   
+        const eraserButton = document.getElementById('eraserButton');
+        const clearButton = document.getElementById('clearButton');
+        const cursorContainer = document.getElementById('cursor-container');
+        
+        // State Variables
+        let isDrawing = false;
+        let lastX = 0;
+        let lastY = 0;
+        let currentColor = colorPicker.value;
+        let currentWidth = strokeWidthInput.value;
+        let isErasing = false;
+        let myUserId = null;
+        let myUserColor = null;
+        const usersListElement = document.getElementById('onlineUsersList');
+        const userCountElement = document.getElementById('userCount');
+        const activeCursors = {}; 
+        
+        // --- UNDO/REDO ELEMENTS & STROKE BUFFER ---
+        const undoButton = document.getElementById('undoButton');
+        const redoButton = document.getElementById('redoButton');
+        // CRITICAL NEW VARIABLE: Buffer to hold segments of ONE single stroke
+        let currentStrokeSegments = []; 
+
+        // Initial Canvas Context Setup
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.lineWidth = currentWidth;
+        ctx.strokeStyle = currentColor; 
+        ctx.globalCompositeOperation = 'source-over'; 
+
+        // Helper function for user list lookup
+        function getUsersList() {
+            return window.globalUserList || []; 
+        }
+
+        // --- CORE DRAWING FUNCTIONS ---
+        function clearLocalCanvas() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+        
+        function drawLine(data) {
+            const { x0, y0, x1, y1, color, width, mode } = data; 
+            
+            ctx.save();
+            
+            ctx.lineWidth = width; 
+            
+            if (mode === 'erase') {
+                ctx.globalCompositeOperation = 'destination-out';
+            } else {
+                ctx.globalCompositeOperation = 'source-over'; 
+                ctx.strokeStyle = color; 
+            }
+
+            ctx.beginPath();
+            ctx.moveTo(x0, y0);
+            ctx.lineTo(x1, y1);
+            ctx.stroke();
+            
+            ctx.restore();
+        }
+
+        // --- HISTORY REPLAY FUNCTION ---
+        function replayHistory(commands) {
+            clearLocalCanvas();
+            
+            commands.forEach(command => {
+                if (command.type === 'stroke') {
+                    // CRITICAL: Iterate over all segments within this stroke command
+                    command.data.forEach(segment => {
+                        drawLine(segment); 
+                    });
+                } else if (command.type === 'clear') {
+                    clearLocalCanvas();
+                }
+            });
+        }
+
+
+        // --- SOCKET LISTENERS ---
+
+        // 1. Receive my own info (ID and color)
+        socket.on('user-info', (data) => {
+            myUserId = data.id;
+            myUserColor = data.color;
+            
+            colorPicker.value = myUserColor;
+            currentColor = myUserColor;
+            ctx.strokeStyle = myUserColor;
+        });
+        
+        // 2. Receive the updated list of ALL users
+        socket.on('users-update', (users) => {
+            window.globalUserList = users; 
+            
+            usersListElement.innerHTML = ''; 
+            userCountElement.textContent = users.length;
+            
+            users.forEach(user => {
+                const li = document.createElement('li');
+                li.setAttribute('data-user-id', user.id);
+                li.innerHTML = `<span style="color:${user.color};">•</span> ${user.name} ${user.id === myUserId ? '(You)' : ''}`;
+                usersListElement.appendChild(li);   
+                
+                if (activeCursors[user.id]) {
+                    activeCursors[user.id].style.backgroundColor = user.color;
+                }
+            });
+            
+            // Clean up cursors for disconnected users
+            const currentIds = new Set(users.map(u => u.id));
+            Object.keys(activeCursors).forEach(id => {
+                if (!currentIds.has(id)) {
+                    activeCursors[id].remove();
+                    delete activeCursors[id];
+                }
+            });
+        });
+        
+        // 3. Receive Chat Messages
+        socket.on('chat message', function(fullMsg) {
+            const item = document.createElement('li');
+            item.textContent = fullMsg; 
+            messages.appendChild(item);
+            window.scrollTo(0, document.body.scrollHeight);
+        });
+
+        // 4. Global Command Listener (Handles immediate clear)
+        socket.on('command', (command) => {
+            if (command.type === 'clear') {
+                clearLocalCanvas();
+            }
+        });
+        
+        // 5. Initial History Listener (Sets up the canvas on connect)
+        socket.on('initial-history', (commands) => {
+            replayHistory(commands);
+            undoButton.disabled = commands.length === 0;
+            redoButton.disabled = true; 
+        });
+        
+        // 6. History Replay Listener (Handles Undo/Redo commands)
+        socket.on('history-replay', (data) => {
+            replayHistory(data.commands); 
+            
+            undoButton.disabled = data.pointer <= 0;
+            redoButton.disabled = data.pointer >= data.total;
+        });
+        
+        // 7. History State Listener (For instant button enable after drawing)
+        socket.on('history-state', (data) => {
+            undoButton.disabled = data.pointer <= 0;
+            redoButton.disabled = data.pointer >= data.total;
+        });
+        
+        // 8. Real-time Segment Listener (For remote drawing feedback)
+        socket.on('segment-draw', (segment) => {
+            drawLine(segment);
+        });
+
+        // 9. Cursor Receiving Logic
+        socket.on('cursor-update', (data) => {
+            const { id, x, y } = data;
+            if (id === myUserId) return;
+
+            let cursorDiv = activeCursors[id];
+            const userColorData = window.globalUserList ? 
+                                  window.globalUserList.find(u => u.id === id) : null; 
+            const color = userColorData ? userColorData.color : '#aaaaaa';
+
+            if (!cursorDiv) {
+                cursorDiv = document.createElement('div');
+                cursorDiv.className = 'user-cursor';
+                cursorDiv.id = `cursor-${id}`;
+                cursorContainer.appendChild(cursorDiv);
+                activeCursors[id] = cursorDiv;
+            } 
+            
+            cursorDiv.style.backgroundColor = color;
+            cursorDiv.style.left = `${x}px`;
+            cursorDiv.style.top = `${y}px`;
+        });
+
+
+        // --- INPUT CONTROLS LISTENERS ---
+
+        // Chat Submit
+        form.addEventListener('submit', function(e) {
+            e.preventDefault();
+            if (input.value) {
+                socket.emit('chat message', input.value); 
+                input.value = '';
+            }
+        });
+
+        // Stroke Width Change
+        strokeWidthInput.addEventListener('input', (e) => {
+            currentWidth = e.target.value;
+            widthValueSpan.textContent = currentWidth;
+            ctx.lineWidth = currentWidth;
+            ctx.globalCompositeOperation = isErasing ? 'destination-out' : 'source-over';
+        });
+
+        // Color Change
+        colorPicker.addEventListener('change', (e) => {
+            currentColor = e.target.value;
+            ctx.strokeStyle = currentColor;
+            isErasing = false;
+            eraserButton.classList.remove('active-tool');
+            ctx.globalCompositeOperation = 'source-over'; 
+            socket.emit('color-change', currentColor); 
+        });
+
+        // Eraser Toggle
+        eraserButton.addEventListener('click', () => {
+            isErasing = true;
+            eraserButton.classList.add('active-tool');
+            ctx.globalCompositeOperation = 'destination-out';
+        });
+
+        // Clear Button
+        clearButton.addEventListener('click', () => {
+            clearLocalCanvas();
+            socket.emit('clear');
+        });
+        
+        // --- DRAWING AND CURSOR LOGIC ---
+        
+        function handleMouseMove(e) {
+            const rect = canvas.getBoundingClientRect();
+            const currentX = e.clientX - rect.left;
+            const currentY = e.clientY - rect.top;
+
+            // 1. Emit Cursor Position (Always happens on mousemove)
+            if (myUserId) {
+                socket.emit('cursor-move', { x: currentX, y: currentY });
+            }
+            
+            // 2. Execute Drawing Logic (Only happens if mouse is down)
+            if (isDrawing) { 
+                ctx.beginPath();
+                ctx.moveTo(lastX, lastY);
+                ctx.lineTo(currentX, currentY);
+                ctx.stroke();
+                
+                // CRITICAL: SAVE TO LOCAL BUFFER & SEND REAL-TIME SEGMENT
+                const segmentData = {
+                    x0: lastX, y0: lastY, x1: currentX, y1: currentY,
+                    color: isErasing ? '#FFFFFF' : currentColor,
+                    width: currentWidth, mode: isErasing ? 'erase' : 'draw'
+                };
+                
+                currentStrokeSegments.push(segmentData);
+                socket.emit('segment-draw', segmentData); // Real-time feedback
+            }
+
+            // 3. Update position
+            lastX = currentX;
+            lastY = currentY;
+        }
+
+        // EVENT LISTENERS for DRAWING
+        canvas.addEventListener('mousemove', handleMouseMove);
+
+        canvas.addEventListener('mousedown', (e) => {
+            isDrawing = true;
+            currentStrokeSegments = []; // CRITICAL: Start a new stroke buffer
+            const rect = canvas.getBoundingClientRect();
+            lastX = e.clientX - rect.left;
+            lastY = e.clientY - rect.top;
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            if (isDrawing && currentStrokeSegments.length > 0) {
+                // CRITICAL: Send the entire stroke as ONE command for UNDO
+                socket.emit('new-stroke', currentStrokeSegments);
+                currentStrokeSegments = []; // Clear buffer
+            }
+            isDrawing = false;
+        });
+        
+        canvas.addEventListener('mouseout', () => isDrawing = false); 
+        
+        // --- UNDO/REDO BUTTON LISTENERS ---
+        undoButton.addEventListener('click', () => {
+            socket.emit('undo'); 
+        });
+
+        redoButton.addEventListener('click', () => {
+            socket.emit('redo'); 
+        });
+    </script>
+</body>
+</html> -->
+
+
+
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Collaborative Canvas Chat</title>
+    <style>
+        body { 
+            margin: 0; 
+            padding-bottom: 3rem; 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            text-align: center;
+        }
+        #canvas {
+            border: 1px solid #ccc;
+            background-color: #fff;
+            cursor: crosshair;
+            display: block;
+            margin: 20px auto;
+        }
+        #form { 
+            background: rgba(0, 0, 0, 0.15); 
+            padding: 0.25rem; 
+            position: fixed; 
+            bottom: 0; 
+            left: 0; 
+            right: 0; 
+            display: flex; 
+            height: 3rem; 
+            box-sizing: border-box; 
+            backdrop-filter: blur(10px); 
+        }
+        #input { 
+            border: none; 
+            padding: 0 1rem; 
+            flex-grow: 1; 
+            border-radius: 2rem; 
+            margin: 0.25rem; 
+        }
+        #input:focus { outline: none; }
+        #form > button { 
+            background: #333; 
+            border: none; 
+            padding: 0 1rem; 
+            margin: 0.25rem; 
+            border-radius: 3px; 
+            outline: none; 
+            color: #fff; 
+            cursor: pointer;
+        }
+        #messages { 
+            list-style-type: none; 
+            margin: 0; 
+            padding: 0; 
+            max-width: 800px; 
+            margin: 20px auto;
+            text-align: left;
+            height: 150px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            padding: 10px;
+            background: #fafafa;
+        }
+        #messages > li { 
+            padding: 0.5rem 1rem; 
+        }
+        #messages > li:nth-child(odd) { background: #efefef; }
+        .active-tool {
+            border: 2px solid #007bff;
+            background-color: #e9ecef;
+        }
+        .user-cursor {
+            position: absolute;
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+            border: 2px solid white;
+            opacity: 0.8;
+            transform: translate(-50%, -50%);
+            transition: transform 0.05s ease-out;
+            z-index: 1000;
+            pointer-events: none;
+        }
+        .controls-container {
+            margin: 10px auto;
+            width: 800px;
+            text-align: left;
+            padding-left: 10px;
+        }
+        .controls-container > * {
+            margin-right: 15px;
+        }
+    </style>
+</head>
+<body>
+    
+    <div class="controls-container">
+        <label for="colorPicker">Select Color:</label>
+        <input type="color" id="colorPicker" value="#000000">
+
+        <label for="strokeWidth">Width:</label>
+        <input type="range" id="strokeWidth" min="1" max="50" value="5">
+        <span id="widthValue">5</span>px
+
+        <button id="eraserButton">Eraser</button>
+        <button id="undoButton">Undo</button>
+        <button id="redoButton">Redo</button>
+        <button id="clearButton">Clear Canvas</button>
+    </div>
+
+    <div style="position: relative; width: 800px; height: 600px; margin: 20px auto;">
+        <canvas id="canvas" width="800" height="600"></canvas>
+        <div id="cursor-container"></div>
+    </div>
+
+    <div style="margin-top: 10px; width: 800px; margin: 20px auto;">
+        <h4>Online Users: <span id="userCount">0</span></h4>
+        <ul id="onlineUsersList" style="list-style: none; padding: 0;"></ul>
+    </div>
+    
+    <ul id="messages"></ul>
+
+    <form id="form">
+        <input id="input" autocomplete="off" placeholder="Type a message..." />
+        <button>Send</button>
+    </form>
+
+    <script src="/socket.io/socket.io.js"></script>
+    
+    <script>
+        // Initialize the connection to the server
+        const socket = io('http://localhost:3000'); 
+        
+        // DOM references
+        const form = document.getElementById('form');
+        const input = document.getElementById('input');
+        const messages = document.getElementById('messages');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const colorPicker = document.getElementById('colorPicker');
+        const strokeWidthInput = document.getElementById('strokeWidth'); 
+        const widthValueSpan = document.getElementById('widthValue');   
+        const eraserButton = document.getElementById('eraserButton');
+        const clearButton = document.getElementById('clearButton');
+        const cursorContainer = document.getElementById('cursor-container');
+        
+        // State tracking variables
+        let drawingActive = false;
+        let prevX = 0;
+        let prevY = 0;
+        let currentColor = colorPicker.value;
+        let currentStrokeWidth = strokeWidthInput.value;
+        let erasingMode = false;
+        let userId = null;
+        let userColor = null;
+        const usersListElement = document.getElementById('onlineUsersList');
+        const userCountElement = document.getElementById('userCount');
+        const currentCursors = {}; 
+        
+        const undoButton = document.getElementById('undoButton');
+        const redoButton = document.getElementById('redoButton');
+        
+        // Buffer for all segments in the ongoing stroke
+        let ongoingStrokeSegments = []; 
+
+        // Set initial canvas properties for smooth drawing
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.lineWidth = currentStrokeWidth;
+        ctx.strokeStyle = currentColor;
+        ctx.globalCompositeOperation = 'source-over';
+
+        // Helper function to get the current user list globally
+        function getCurrentUserList() {
+            return window.globalUserList || [];
+        }
+
+        // Clear the canvas content locally
+        function clearCanvas() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+        
+        // Draw a single line segment based on passed data
+        function drawSegment(segment) {
+            const { x0, y0, x1, y1, color, width, mode } = segment;
+            
+            ctx.save();
+            
+            ctx.lineWidth = width;
+            if (mode === 'erase') {
+                ctx.globalCompositeOperation = 'destination-out';
+            } else {
+                ctx.globalCompositeOperation = 'source-over';
+                ctx.strokeStyle = color;
+            }
+
+            ctx.beginPath();
+            ctx.moveTo(x0, y0);
+            ctx.lineTo(x1, y1);
+            ctx.stroke();
+
+            ctx.restore();
+        }
+
+        // Replay an array of drawing commands to reflect full history
+        function replayDrawingHistory(commands) {
+            clearCanvas();
+            commands.forEach(command => {
+                if (command.type === 'stroke') {
+                    command.data.forEach(drawSegment);
+                } else if (command.type === 'clear') {
+                    clearCanvas();
+                }
+            });
+        }
+
+        // Socket events
+
+        // Receive user info: id and assigned color
+        socket.on('user-info', (data) => {
+            userId = data.id;
+            userColor = data.color;
+
+            colorPicker.value = userColor;
+            currentColor = userColor;
+            ctx.strokeStyle = userColor;
+        });
+
+        // Update the list of online users and cursor colors
+        socket.on('users-update', (users) => {
+            window.globalUserList = users;
+
+            usersListElement.innerHTML = '';
+            userCountElement.textContent = users.length;
+
+            users.forEach(user => {
+                const li = document.createElement('li');
+                li.dataset.userId = user.id;
+                li.innerHTML = `<span style="color:${user.color};">•</span> ${user.name} ${user.id === userId ? '(You)' : ''}`;
+                usersListElement.appendChild(li);
+
+                if (currentCursors[user.id]) {
+                    currentCursors[user.id].style.backgroundColor = user.color;
+                }
+            });
+
+            // Remove cursors of disconnected users
+            const validIds = new Set(users.map(u => u.id));
+            Object.keys(currentCursors).forEach(id => {
+                if (!validIds.has(id)) {
+                    currentCursors[id].remove();
+                    delete currentCursors[id];
+                }
+            });
+        });
+
+        // Append new chat message to messages list
+        socket.on('chat message', (msg) => {
+            const item = document.createElement('li');
+            item.textContent = msg;
+            messages.appendChild(item);
+            window.scrollTo(0, document.body.scrollHeight);
+        });
+
+        // Clear canvas when instructed by server
+        socket.on('command', (command) => {
+            if (command.type === 'clear') {
+                clearCanvas();
+            }
+        });
+
+        // Receive initial drawing history after connecting
+        socket.on('initial-history', (commands) => {
+            replayDrawingHistory(commands);
+            undoButton.disabled = commands.length === 0;
+            redoButton.disabled = true;
+        });
+
+        // Replay drawing history for undo/redo commands
+        socket.on('history-replay', (data) => {
+            replayDrawingHistory(data.commands);
+
+            undoButton.disabled = (data.pointer <= 0);
+            redoButton.disabled = (data.pointer >= data.total);
+        });
+
+        // Manage the state of undo/redo buttons
+        socket.on('history-state', (data) => {
+            undoButton.disabled = (data.pointer <= 0);
+            redoButton.disabled = (data.pointer >= data.total);
+        });
+
+        // Draw individual line segments in real-time
+        socket.on('segment-draw', (segment) => {
+            drawSegment(segment);
+        });
+
+        // Update remote user cursor position
+        socket.on('cursor-update', (data) => {
+            const { id, x, y } = data;
+            if (id === userId) return;
+
+            let cursorElem = currentCursors[id];
+            const userData = window.globalUserList?.find(u => u.id === id);
+            const color = userData?.color || '#aaaaaa';
+
+            if (!cursorElem) {
+                cursorElem = document.createElement('div');
+                cursorElem.className = 'user-cursor';
+                cursorElem.id = `cursor-${id}`;
+                cursorContainer.appendChild(cursorElem);
+                currentCursors[id] = cursorElem;
+            }
+            
+            cursorElem.style.backgroundColor = color;
+            cursorElem.style.left = `${x}px`;
+            cursorElem.style.top = `${y}px`;
+        });
+
+        // Event listeners for user interactions
+
+        // Chat form submission
+        form.addEventListener('submit', (e) => {
+            e.preventDefault();
+            if (input.value) {
+                socket.emit('chat message', input.value);
+                input.value = '';
+            }
+        });
+
+        // Change stroke width
+        strokeWidthInput.addEventListener('input', (e) => {
+            currentStrokeWidth = e.target.value;
+            widthValueSpan.textContent = currentStrokeWidth;
+            ctx.lineWidth = currentStrokeWidth;
+            ctx.globalCompositeOperation = erasingMode ? 'destination-out' : 'source-over';
+        });
+
+        // Change color picker value
+        colorPicker.addEventListener('change', (e) => {
+            currentColor = e.target.value;
+            ctx.strokeStyle = currentColor;
+            erasingMode = false;
+            eraserButton.classList.remove('active-tool');
+            ctx.globalCompositeOperation = 'source-over';
+            socket.emit('color-change', currentColor);
+        });
+
+        // Toggle eraser
+        eraserButton.addEventListener('click', () => {
+            erasingMode = true;
+            eraserButton.classList.add('active-tool');
+            ctx.globalCompositeOperation = 'destination-out';
+        });
+
+        // Clear canvas action
+        clearButton.addEventListener('click', () => {
+            clearCanvas();
+            socket.emit('clear');
+        });
+
+        // Drawing and cursor movement logic
+
+        function onMouseMove(e) {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+
+            // Broadcast cursor position to others
+            if (userId) {
+                socket.emit('cursor-move', { x, y });
+            }
+
+            if (!drawingActive) return;
+
+            ctx.beginPath();
+            ctx.moveTo(prevX, prevY);
+            ctx.lineTo(x, y);
+            ctx.stroke();
+
+            // Buffer this drawn segment and broadcast to peers
+            const segment = {
+                x0: prevX, y0: prevY, x1: x, y1: y,
+                color: erasingMode ? '#FFFFFF' : currentColor,
+                width: currentStrokeWidth,
+                mode: erasingMode ? 'erase' : 'draw'
+            };
+
+            ongoingStrokeSegments.push(segment);
+            socket.emit('segment-draw', segment);
+
+            prevX = x;
+            prevY = y;
+        }
+
+        canvas.addEventListener('mousemove', onMouseMove);
+
+        canvas.addEventListener('mousedown', (e) => {
+            drawingActive = true;
+            ongoingStrokeSegments = [];
+            const rect = canvas.getBoundingClientRect();
+            prevX = e.clientX - rect.left;
+            prevY = e.clientY - rect.top;
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            if (drawingActive && ongoingStrokeSegments.length > 0) {
+                socket.emit('new-stroke', ongoingStrokeSegments);
+                ongoingStrokeSegments = [];
+            }
+            drawingActive = false;
+        });
+
+        canvas.addEventListener('mouseout', () => {
+            drawingActive = false;
+        });
+
+        // Undo and redo controls
+        undoButton.addEventListener('click', () => {
+            socket.emit('undo');
+        });
+
+        redoButton.addEventListener('click', () => {
+            socket.emit('redo');
+        });
+
+    </script>
+</body>
+</html>
