@@ -2,6 +2,12 @@
 
 This is a real-time, collaborative drawing application built using Vanilla JavaScript and Node.js with Socket.IO. It allows multiple users to draw, chat, and synchronize complex actions like undo/redo across all connected clients instantly.
 
+# Collaborative Canvas: Real-time Drawing Board
+
+## 🚀 Live Demo
+
+**Collaborate Live Here:** [Collaborative Canvas Live Deployment](https://collaborative-canvas-anchal.onrender.com)
+
 ## 🛠️ Setup Instructions
 
 To get the project running locally, follow these steps:
