@@ -171,6 +171,6 @@ io.on('connection', (socket) => {
 
 // 6. Start server on specified port
 const PORT = process.env.PORT || 3000;
-httpServer.listen(PORT, () => {
+Server.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
 });
